@@ -1,12 +1,11 @@
 """
-Self-contained Streamlit app for Streamlit Community Cloud.
-Fetches live data directly — no local database or backend process needed.
+Real-Time Correlation Breakdown Detector — Streamlit Cloud edition.
+Self-contained: fetches live data from Yahoo Finance, no database needed.
 """
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,23 +18,30 @@ st.set_page_config(
     page_title="Correlation Breakdown Detector",
     page_icon="📊",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ── Asset Universe ────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+[data-testid="stMetricValue"] { font-size: 2rem; font-weight: 700; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Asset Universe ─────────────────────────────────────────────────────────────
 
 ASSETS: Dict[str, List[str]] = {
-    "equities":    ["SPY", "QQQ", "IWM", "EEM", "XLF", "XLE", "XLK"],
-    "bonds":       ["TLT", "IEF", "HYG", "LQD", "TIP"],
+    "equities":    ["SPY", "QQQ", "IWM", "EEM", "VEA", "XLF", "XLE", "XLK", "XLV", "XLU"],
+    "bonds":       ["TLT", "IEF", "SHY", "HYG", "LQD", "TIP"],
     "commodities": ["GLD", "SLV", "USO", "DBA"],
     "currencies":  ["UUP", "FXE", "FXY"],
     "crypto":      ["BTC-USD", "ETH-USD", "SOL-USD"],
 }
 
-CLASS_MAP: Dict[str, str] = {
-    sym: cls for cls, syms in ASSETS.items() for sym in syms
-}
-
+CLASS_MAP: Dict[str, str] = {s: c for c, syms in ASSETS.items() for s in syms}
 ALL_SYMBOLS = [s for syms in ASSETS.values() for s in syms]
+
+SEVERITY_LEVELS = [(4.0, "extreme"), (3.0, "severe"), (2.0, "moderate"), (0.0, "mild")]
+SEV_COLOR = {"extreme": "#9C27B0", "severe": "#F44336", "moderate": "#FF9800", "mild": "#FFC107"}
 
 HEDGE_RULES: Dict[Tuple, List[Dict]] = {
     ("bonds", "equities", "positive_spike"): [
@@ -55,16 +61,28 @@ HEDGE_RULES: Dict[Tuple, List[Dict]] = {
     ("crypto", "equities", "positive_spike"): [
         {"instrument": "BITI", "direction": "long", "weight": 0.04,
          "rationale": "Short Bitcoin ETF hedges crypto downside when crypto follows equities lower."},
+        {"instrument": "SPY_PUT", "direction": "long", "weight": 0.03,
+         "rationale": "SPY puts provide tail-risk protection; crypto risk-off signals equity weakness."},
+    ],
+    ("crypto", "equities", "negative_spike"): [
+        {"instrument": "BITX", "direction": "long", "weight": 0.03,
+         "rationale": "2x BTC ETF captures crypto alpha when it decouples positively from equities."},
     ],
     ("commodities", "equities", "negative_spike"): [
         {"instrument": "PDBC", "direction": "long", "weight": 0.10,
          "rationale": "Broad commodity ETF captures inflation-driven rally vs equity weakness."},
+        {"instrument": "XLE",  "direction": "long", "weight": 0.07,
+         "rationale": "Energy sector outperforms when oil rallies while equities lag."},
         {"instrument": "GLD",  "direction": "long", "weight": 0.08,
          "rationale": "Gold benefits from inflation regime driving commodity-equity divergence."},
     ],
     ("commodities", "equities", "positive_spike"): [
         {"instrument": "SH", "direction": "long", "weight": 0.07,
          "rationale": "Inverse S&P when deflation fears pull both equities and commodities down."},
+    ],
+    ("currencies", "equities", "positive_spike"): [
+        {"instrument": "UUP", "direction": "long", "weight": 0.08,
+         "rationale": "USD strengthens in risk-off; hedges FX volatility correlated with equity sell-off."},
     ],
     ("bonds", "commodities", "positive_spike"): [
         {"instrument": "TIP", "direction": "long", "weight": 0.10,
@@ -78,11 +96,7 @@ HEDGE_RULES: Dict[Tuple, List[Dict]] = {
     ],
 }
 
-SEVERITY = [(4.0, "extreme"), (3.0, "severe"), (2.0, "moderate"), (0.0, "mild")]
-SEV_COLOR = {"extreme": "#9C27B0", "severe": "#F44336", "moderate": "#FF9800", "mild": "#FFC107"}
-
-
-# ── Data fetching ─────────────────────────────────────────────────────────────
+# ── Data helpers ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_prices(symbols: tuple, days: int) -> pd.DataFrame:
@@ -90,22 +104,16 @@ def fetch_prices(symbols: tuple, days: int) -> pd.DataFrame:
     df = yf.download(list(symbols), start=start, auto_adjust=True, progress=False, threads=True)
     if df.empty:
         return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df["Close"]
-    else:
-        df = df[["Close"]].rename(columns={"Close": symbols[0]})
-    return df.dropna(how="all")
+    close = df["Close"] if isinstance(df.columns, pd.MultiIndex) else df[["Close"]].rename(columns={"Close": symbols[0]})
+    return close.dropna(how="all")
 
-
-# ── Correlation helpers ───────────────────────────────────────────────────────
 
 def rolling_corr_matrix(prices: pd.DataFrame, window: int) -> pd.DataFrame:
     returns = prices.pct_change().dropna(how="all")
-    tail = returns.tail(window)
-    return tail.corr().clip(-1.0, 1.0)
+    return returns.tail(window).corr().clip(-1.0, 1.0)
 
 
-def pair_map(corr: pd.DataFrame) -> Dict[str, float]:
+def get_pair_map(corr: pd.DataFrame) -> Dict[str, float]:
     cols = corr.columns.tolist()
     return {
         f"{cols[i]}|{cols[j]}": float(corr.iloc[i, j])
@@ -114,7 +122,7 @@ def pair_map(corr: pd.DataFrame) -> Dict[str, float]:
     }
 
 
-def baseline_stats(prices: pd.DataFrame, short_w: int, long_w: int) -> Dict[str, Dict]:
+def compute_baseline(prices: pd.DataFrame, short_w: int, long_w: int) -> Dict[str, Dict]:
     returns = prices.pct_change().dropna(how="all")
     stats: Dict[str, Dict] = {}
     cols = returns.columns.tolist()
@@ -122,17 +130,15 @@ def baseline_stats(prices: pd.DataFrame, short_w: int, long_w: int) -> Dict[str,
         for j, b in enumerate(cols):
             if j <= i:
                 continue
-            key = f"{a}|{b}"
-            series = returns[a].rolling(short_w).corr(returns[b]).dropna()
-            if len(series) < 10:
-                continue
-            stats[key] = {"mean": float(series.mean()), "std": float(series.std())}
+            s = returns[a].rolling(short_w).corr(returns[b]).dropna()
+            if len(s) >= 10:
+                stats[f"{a}|{b}"] = {"mean": float(s.mean()), "std": float(s.std())}
     return stats
 
 
-def detect_breakdowns(cur: Dict[str, float], stats: Dict[str, Dict], threshold: float) -> List[Dict]:
+def detect_breakdowns(pairs: Dict[str, float], stats: Dict[str, Dict], threshold: float) -> List[Dict]:
     bds = []
-    for key, corr in cur.items():
+    for key, corr in pairs.items():
         if key not in stats:
             continue
         mean, std = stats[key]["mean"], stats[key]["std"]
@@ -142,7 +148,7 @@ def detect_breakdowns(cur: Dict[str, float], stats: Dict[str, Dict], threshold: 
         if abs(z) < threshold:
             continue
         a1, a2 = key.split("|")
-        sev = next(s for thresh, s in SEVERITY if abs(z) >= thresh)
+        sev = next(s for t, s in SEVERITY_LEVELS if abs(z) >= t)
         bds.append({
             "pair": f"{a1} / {a2}", "pair_key": key,
             "asset1": a1, "asset2": a2,
@@ -156,8 +162,7 @@ def detect_breakdowns(cur: Dict[str, float], stats: Dict[str, Dict], threshold: 
 
 def get_hedges(bd: Dict) -> List[Dict]:
     c1, c2 = sorted([bd["class1"], bd["class2"]])
-    key = (c1, c2, bd["direction"])
-    rules = HEDGE_RULES.get(key, [])
+    rules = HEDGE_RULES.get((c1, c2, bd["direction"]), [])
     if not rules:
         return [{"instrument": "GLD", "direction": "long", "weight": 0.05,
                  "rationale": f"Gold as generic diversifier for {bd['pair']} breakdown (z={bd['z']:.2f})."}]
@@ -165,107 +170,192 @@ def get_hedges(bd: Dict) -> List[Dict]:
     return [{**r, "weight": round(min(r["weight"] * scale, 0.25), 3)} for r in rules]
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+def run_backtest(
+    prices: pd.DataFrame, benchmark: str, short_w: int, long_w: int,
+    z_thresh: float, hold_days: int = 10, rebal_days: int = 5,
+) -> Dict:
+    rets = prices.pct_change().dropna(how="all")
+    if benchmark not in rets.columns:
+        benchmark = rets.columns[0]
+    dates = rets.index.tolist()
+    hedged, unhedged = [1.0], [1.0]
+    breakdown_log, active_hedge, expire_i = [], None, 0
+
+    for i in range(long_w, len(dates)):
+        bm_ret = float(rets.iloc[i].get(benchmark, 0) or 0)
+        if (i - long_w) % rebal_days == 0:
+            hist = rets.iloc[:i]
+            stats = compute_baseline(prices.iloc[:i], short_w, long_w)
+            corr = rolling_corr_matrix(prices.iloc[:i], short_w)
+            pairs = get_pair_map(corr)
+            bds = detect_breakdowns(pairs, stats, z_thresh)
+            if bds:
+                breakdown_log.append({"date": str(dates[i].date()), "count": len(bds)})
+                expire_i = i + hold_days
+                active_hedge = {}
+                for bd in bds[:5]:
+                    for h in get_hedges(bd):
+                        inst = h["instrument"]
+                        if inst in rets.columns and not inst.endswith("_PUT"):
+                            sign = 1.0 if h["direction"] == "long" else -1.0
+                            active_hedge[inst] = active_hedge.get(inst, 0.0) + sign * h["weight"]
+            else:
+                if i > expire_i:
+                    active_hedge = None
+
+        hedge_ret = 0.0
+        if active_hedge:
+            for inst, w in active_hedge.items():
+                r = rets.iloc[i].get(inst, 0)
+                hedge_ret += w * float(r or 0)
+
+        unhedged.append(unhedged[-1] * (1 + bm_ret))
+        hedged.append(hedged[-1] * (1 + bm_ret + hedge_ret))
+
+    dates_out = [str(d.date()) for d in dates[long_w:]]
+    h_arr, u_arr = np.array(hedged[1:]), np.array(unhedged[1:])
+
+    def sharpe(arr):
+        r = np.diff(arr) / arr[:-1]
+        return float(np.mean(r) / np.std(r) * np.sqrt(252)) if np.std(r) > 0 else 0.0
+
+    def mdd(arr):
+        peak = np.maximum.accumulate(arr)
+        return float(((arr - peak) / peak).min())
+
+    eq = {d: {"hedged": round(float(h), 6), "unhedged": round(float(u), 6)}
+          for d, h, u in zip(dates_out, h_arr, u_arr)}
+
+    return {
+        "total_return_hedged":   round(float(h_arr[-1] - 1), 4),
+        "total_return_unhedged": round(float(u_arr[-1] - 1), 4),
+        "sharpe_hedged":         round(sharpe(h_arr), 3),
+        "sharpe_unhedged":       round(sharpe(u_arr), 3),
+        "max_drawdown_hedged":   round(mdd(h_arr), 4),
+        "max_drawdown_unhedged": round(mdd(u_arr), 4),
+        "num_breakdowns":        len(breakdown_log),
+        "equity_curve":          eq,
+        "benchmark":             benchmark,
+    }
+
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.title("📊 Correlation Detector")
-    st.caption("Live data · No database · Updates every 5 min")
+    st.caption("Real-time breakdown detection & hedge optimizer")
     st.divider()
 
-    history_days = st.slider("History (days)", 60, 365, 180)
-    short_window = st.slider("Rolling window (days)", 10, 60, 30)
-    long_window = st.slider("Baseline window (days)", 60, 252, 120)
-    z_threshold = st.slider("Z-score threshold", 1.0, 4.0, 2.0, 0.25)
-
-    selected_class = st.selectbox(
-        "Filter asset class", ["All"] + list(ASSETS.keys())
-    )
-    st.divider()
-    st.caption(f"Data cached for 5 min · Last load: {datetime.now().strftime('%H:%M:%S')}")
-    if st.button("🔄 Force Refresh", width="stretch"):
+    if st.button("🔄  Refresh Live Data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
-# ── Load data ─────────────────────────────────────────────────────────────────
+    st.subheader("Filters")
+    asset_classes = ["All"] + list(ASSETS.keys())
+    selected_class = st.selectbox("Asset Class", asset_classes)
+    z_threshold = st.slider("Min |Z-Score|", 0.5, 5.0, 2.0, 0.25)
+    history_days = st.slider("History Window (days)", 60, 365, 180)
+    short_window = st.slider("Rolling Window (days)", 10, 90, 30)
+    long_window  = st.slider("Baseline Window (days)", 60, 252, 120)
 
-with st.spinner("Fetching live prices..."):
-    prices = fetch_prices(tuple(ALL_SYMBOLS), history_days + long_window)
+    st.divider()
+    st.subheader("Backtest Settings")
+    bt_benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "TLT", "GLD"])
+    bt_z = st.slider("Backtest Z-Threshold", 1.0, 4.0, 2.0, 0.25)
+    run_bt = st.button("▶  Run Backtest", width="stretch")
 
-if prices.empty:
-    st.error("Could not fetch price data. Check your internet connection.")
+    st.divider()
+    st.caption(f"Data cached 5 min · {datetime.now().strftime('%H:%M:%S')}")
+
+# ── Load data ──────────────────────────────────────────────────────────────────
+
+with st.spinner("Fetching live prices from Yahoo Finance…"):
+    prices_raw = fetch_prices(tuple(ALL_SYMBOLS), history_days + long_window + 30)
+
+if prices_raw.empty:
+    st.error("Could not fetch price data. Check your internet connection and try refreshing.")
     st.stop()
 
-# Filter by class
+# Apply asset class filter
 if selected_class != "All":
-    keep = [s for s in prices.columns if CLASS_MAP.get(s) == selected_class]
-    display_prices = prices[keep] if keep else prices
+    keep = [s for s in prices_raw.columns if CLASS_MAP.get(s) == selected_class]
+    prices = prices_raw[keep] if keep else prices_raw
 else:
-    display_prices = prices
+    prices = prices_raw
 
-available = display_prices.dropna(axis=1, thresh=short_window).columns.tolist()
+available = prices.dropna(axis=1, thresh=short_window).columns.tolist()
 if len(available) < 2:
-    st.error("Not enough assets with data. Try widening the history window.")
+    st.error("Not enough assets with sufficient data. Try widening the history window.")
     st.stop()
 
-with st.spinner("Computing correlations..."):
-    corr = rolling_corr_matrix(display_prices[available], short_window)
-    cur_pairs = pair_map(corr)
-    stats = baseline_stats(display_prices[available], short_window, long_window)
-    breakdowns = detect_breakdowns(cur_pairs, stats, z_threshold)
+with st.spinner("Computing correlations…"):
+    corr_matrix = rolling_corr_matrix(prices[available], short_window)
+    cur_pairs   = get_pair_map(corr_matrix)
+    stats       = compute_baseline(prices[available], short_window, long_window)
+    breakdowns  = detect_breakdowns(cur_pairs, stats, z_threshold)
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
+# ── Tabs ───────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3 = st.tabs(["📡 Live Heatmap", "⚠️ Breakdowns", "🛡️ Hedge Recommendations"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📡 Live Monitor", "⚠️ Breakdowns", "🛡️ Hedge Recommendations", "📈 Backtesting"]
+)
 
-
-# ══ TAB 1 — HEATMAP ══════════════════════════════════════════════════════════
+# ══ TAB 1 — LIVE MONITOR ══════════════════════════════════════════════════════
 
 with tab1:
-    st.header(f"{short_window}-Day Rolling Correlation Matrix")
-    st.caption(f"{len(available)} assets · data through {prices.index[-1].date()}")
+    st.header("Real-Time Correlation Heatmap")
 
     col_heat, col_stats = st.columns([3, 1])
 
     with col_heat:
-        fig = go.Figure(go.Heatmap(
-            z=corr.values,
-            x=corr.columns.tolist(),
-            y=corr.index.tolist(),
-            colorscale=[[0, "#d73027"], [0.5, "#ffffbf"], [1, "#1a9850"]],
+        st.subheader(f"{short_window}-Day Rolling Correlation Matrix")
+        fig_heat = go.Figure(go.Heatmap(
+            z=corr_matrix.values,
+            x=corr_matrix.columns.tolist(),
+            y=corr_matrix.index.tolist(),
+            colorscale=[[0.0, "#d73027"], [0.5, "#ffffbf"], [1.0, "#1a9850"]],
             zmin=-1, zmax=1,
-            text=np.round(corr.values, 2),
+            text=np.round(corr_matrix.values, 2),
             texttemplate="%{text}",
             hovertemplate="%{y} vs %{x}: %{z:.3f}<extra></extra>",
         ))
-        fig.update_layout(
-            height=560, margin=dict(l=0, r=0, t=10, b=0),
+        fig_heat.update_layout(
+            height=580, margin=dict(l=0, r=0, t=10, b=0),
             paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
             font=dict(color="#fafafa", size=10),
         )
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig_heat, width="stretch")
 
     with col_stats:
-        upper_vals = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool)).stack().values
-        st.metric("Assets", len(available))
+        upper_mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+        upper_vals = corr_matrix.where(upper_mask).stack().values
+
+        st.subheader("Summary Stats")
         st.metric("Avg Correlation", f"{upper_vals.mean():.3f}")
         st.metric("Max Correlation", f"{upper_vals.max():.3f}")
         st.metric("Min Correlation", f"{upper_vals.min():.3f}")
+        st.metric("Std Deviation",   f"{upper_vals.std():.3f}")
         st.metric("Active Breakdowns", len(breakdowns))
 
         st.divider()
-        st.subheader("Extreme Pairs")
-        upper_copy = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool)).copy()
-        upper_copy.index.name = "A"
-        upper_copy.columns.name = "B"
-        ep = upper_copy.stack().reset_index()
-        ep.columns = ["Asset 1", "Asset 2", "Corr"]
-        ep = ep.reindex(ep["Corr"].abs().sort_values(ascending=False).index).head(6)
-        st.dataframe(ep.style.format({"Corr": "{:.3f}"}), hide_index=True, width="stretch")
+        st.subheader("Most Extreme Pairs")
+        ep = corr_matrix.where(upper_mask).copy()
+        ep.index.name   = "Asset 1"
+        ep.columns.name = "Asset 2"
+        ep_df = ep.stack().reset_index()
+        ep_df.columns = ["Asset 1", "Asset 2", "Correlation"]
+        ep_df = ep_df.reindex(ep_df["Correlation"].abs().sort_values(ascending=False).index).head(8)
+        st.dataframe(
+            ep_df.style
+                .background_gradient(cmap="RdYlGn", subset=["Correlation"], vmin=-1, vmax=1)
+                .format({"Correlation": "{:.3f}"}),
+            hide_index=True, width="stretch",
+        )
 
-    # Cross-class heatmap
-    st.subheader("Cross-Asset Class Average Correlation")
+    # Cross-asset class heatmap
+    st.subheader("Cross-Asset Class Correlation Overview")
     class_list = list(ASSETS.keys())
-    returns_all = display_prices[available].pct_change().tail(short_window)
+    rets_tail  = prices[available].pct_change().tail(short_window)
     rows = []
     for c1 in class_list:
         row = []
@@ -275,17 +365,21 @@ with tab1:
             if not s1 or not s2 or c1 == c2:
                 row.append(1.0 if c1 == c2 else float("nan"))
             else:
-                vals = [returns_all[a].corr(returns_all[b]) for a in s1 for b in s2 if a in returns_all and b in returns_all]
+                vals = [rets_tail[a].corr(rets_tail[b]) for a in s1 for b in s2
+                        if a in rets_tail and b in rets_tail]
                 row.append(float(np.nanmean(vals)) if vals else float("nan"))
         rows.append(row)
     class_df = pd.DataFrame(rows, index=class_list, columns=class_list)
-    fig2 = px.imshow(class_df, color_continuous_scale=["#d73027", "#ffffbf", "#1a9850"],
-                     zmin=-1, zmax=1, text_auto=".2f", height=320)
-    fig2.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font=dict(color="#fafafa"))
-    st.plotly_chart(fig2, width="stretch")
+    fig_class = px.imshow(
+        class_df, color_continuous_scale=["#d73027", "#ffffbf", "#1a9850"],
+        zmin=-1, zmax=1, text_auto=".2f",
+        title="Average Cross-Asset Class Correlation", height=350,
+    )
+    fig_class.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font=dict(color="#fafafa"))
+    st.plotly_chart(fig_class, width="stretch")
 
 
-# ══ TAB 2 — BREAKDOWNS ═══════════════════════════════════════════════════════
+# ══ TAB 2 — BREAKDOWNS ════════════════════════════════════════════════════════
 
 with tab2:
     st.header("Active Correlation Breakdowns")
@@ -294,20 +388,28 @@ with tab2:
     for col, sev in zip([c1, c2, c3, c4], ["extreme", "severe", "moderate", "mild"]):
         col.metric(sev.capitalize(), sum(1 for b in breakdowns if b["severity"] == sev))
 
+    st.divider()
+
     if not breakdowns:
         st.success(f"No breakdowns detected above |z| > {z_threshold}.")
     else:
         bd_df = pd.DataFrame([{
-            "Pair": b["pair"], "Class 1": b["class1"], "Class 2": b["class2"],
-            "Current Corr": b["corr"], "Baseline": b["mean"],
-            "Z-Score": b["z"], "Direction": b["direction"], "Severity": b["severity"],
+            "Pair":         b["pair"],
+            "Class 1":      b["class1"],
+            "Class 2":      b["class2"],
+            "Current Corr": b["corr"],
+            "Baseline":     b["mean"],
+            "Z-Score":      b["z"],
+            "Direction":    b["direction"],
+            "Severity":     b["severity"],
         } for b in breakdowns])
 
         def sev_color(val):
             return f"background-color: {SEV_COLOR.get(val, '')}; color: white"
 
         st.dataframe(
-            bd_df.style.map(sev_color, subset=["Severity"])
+            bd_df.style
+                .map(sev_color, subset=["Severity"])
                 .format({"Current Corr": "{:.3f}", "Baseline": "{:.3f}", "Z-Score": "{:+.2f}"}),
             hide_index=True, width="stretch",
         )
@@ -315,63 +417,157 @@ with tab2:
         fig_bar = px.bar(
             bd_df.head(20), x="Pair", y="Z-Score", color="Severity",
             color_discrete_map=SEV_COLOR,
-            title="Breakdown Z-Scores (ranked by severity)",
-            height=380,
+            title="Top 20 Breakdown Z-Scores",
+            height=420,
         )
-        fig_bar.add_hline(y=z_threshold, line_dash="dash", line_color="white",
-                          annotation_text=f"Threshold ±{z_threshold}")
+        fig_bar.add_hline(y=z_threshold,  line_dash="dash", line_color="white",
+                          annotation_text=f"Threshold ({z_threshold})")
         fig_bar.add_hline(y=-z_threshold, line_dash="dash", line_color="white")
         fig_bar.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
                               font=dict(color="#fafafa"))
         st.plotly_chart(fig_bar, width="stretch")
 
 
-# ══ TAB 3 — HEDGES ═══════════════════════════════════════════════════════════
+# ══ TAB 3 — HEDGE RECOMMENDATIONS ════════════════════════════════════════════
 
 with tab3:
     st.header("Hedge Recommendations")
-    st.caption("Positions to neutralize current breakdown risk, scaled by severity.")
+    st.caption("Positions suggested to neutralize active correlation breakdown risk.")
 
     if not breakdowns:
         st.success("No active breakdowns — no hedges needed.")
     else:
-        # Aggregate hedges across all breakdowns
         agg: Dict[str, Dict] = {}
         for bd in breakdowns[:10]:
             for h in get_hedges(bd):
                 inst = h["instrument"]
                 if inst not in agg:
-                    agg[inst] = {"Instrument": inst, "Direction": h["direction"],
+                    agg[inst] = {"Instrument": inst, "Type": "etf", "Direction": h["direction"],
                                  "Weight (%)": 0.0, "Triggered By": [], "Rationale": h["rationale"]}
                 agg[inst]["Weight (%)"] += h["weight"] * 100
                 agg[inst]["Triggered By"].append(bd["pair"])
 
         hedge_df = pd.DataFrame(agg.values())
-        hedge_df["Weight (%)"] = hedge_df["Weight (%)"].clip(upper=25).round(2)
-        hedge_df["Triggered By"] = hedge_df["Triggered By"].apply(lambda x: ", ".join(set(x)))
+        hedge_df["Weight (%)"]    = hedge_df["Weight (%)"].clip(upper=25).round(2)
+        hedge_df["Triggered By"]  = hedge_df["Triggered By"].apply(lambda x: ", ".join(set(x)))
         hedge_df = hedge_df.sort_values("Weight (%)", ascending=False)
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Hedge Instruments", len(hedge_df))
-        m2.metric("Avg Weight", f"{hedge_df['Weight (%)'].mean():.1f}%")
-        m3.metric("Total Breakdowns Hedged", len(breakdowns))
+        m1.metric("Unique Hedge Instruments",    len(hedge_df))
+        m2.metric("Avg Suggested Weight",        f"{hedge_df['Weight (%)'].mean():.1f}%")
+        m3.metric("Max Expected Risk Reduction",
+                  f"{hedge_df.get('Expected Risk Reduction (%)', pd.Series([0])).max():.0f}%"
+                  if "Expected Risk Reduction (%)" in hedge_df else "—")
 
         st.dataframe(
             hedge_df[["Instrument", "Direction", "Weight (%)", "Triggered By"]],
             hide_index=True, width="stretch",
         )
 
-        fig_h = px.bar(
+        fig_hedge = px.bar(
             hedge_df, x="Instrument", y="Weight (%)", color="Direction",
             color_discrete_map={"long": "#2196F3", "short": "#F44336"},
-            title="Suggested Hedge Weights by Instrument",
-            height=350,
+            title="Suggested Hedge Weights", height=380,
         )
-        fig_h.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-                            font=dict(color="#fafafa"))
-        st.plotly_chart(fig_h, width="stretch")
+        fig_hedge.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                                font=dict(color="#fafafa"))
+        st.plotly_chart(fig_hedge, width="stretch")
 
-        with st.expander("Rationale for each hedge"):
+        with st.expander("Hedge Rationale Details"):
             for _, row in hedge_df.iterrows():
-                st.markdown(f"**{row['Instrument']}** ({row['Direction'].upper()} "
-                            f"{row['Weight (%)']:.1f}%): {row['Rationale']}")
+                st.markdown(
+                    f"**{row['Instrument']}** ({row['Direction'].upper()} {row['Weight (%)']:.1f}%): "
+                    f"{row['Rationale']}"
+                )
+
+
+# ══ TAB 4 — BACKTESTING ══════════════════════════════════════════════════════
+
+with tab4:
+    st.header("Hedge Strategy Backtesting")
+    st.caption(
+        "Walk-forward simulation: detect breakdowns on available history, "
+        "apply hedge positions for 10 days, compare vs unhedged benchmark."
+    )
+
+    if "bt_result" not in st.session_state:
+        st.session_state["bt_result"] = None
+
+    if run_bt:
+        bt_long_w = min(long_window, max(60, len(prices_raw) // 3))
+        if len(prices_raw) < bt_long_w + short_window + 10:
+            st.error(f"Need at least {bt_long_w + short_window + 10} days of data. "
+                     f"Increase History Window in sidebar.")
+        else:
+            with st.spinner("Running walk-forward backtest… (30–60 seconds)"):
+                try:
+                    result = run_backtest(
+                        prices_raw, bt_benchmark, short_window,
+                        bt_long_w, bt_z,
+                    )
+                    st.session_state["bt_result"] = result
+                    st.success("Backtest complete!")
+                except Exception as e:
+                    st.error(f"Backtest error: {e}")
+
+    result = st.session_state.get("bt_result")
+
+    if result is None:
+        st.info("Configure settings in the sidebar and click **▶ Run Backtest** to start.")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "Hedged Return",
+            f"{result['total_return_hedged']:.2%}",
+            delta=f"{result['total_return_hedged'] - result['total_return_unhedged']:.2%} vs unhedged",
+        )
+        m2.metric(
+            "Sharpe (Hedged)",
+            f"{result['sharpe_hedged']:.2f}",
+            delta=f"{result['sharpe_hedged'] - result['sharpe_unhedged']:.2f}",
+        )
+        m3.metric(
+            "Max Drawdown (Hedged)",
+            f"{result['max_drawdown_hedged']:.2%}",
+            delta=f"{result['max_drawdown_hedged'] - result['max_drawdown_unhedged']:.2%}",
+            delta_color="inverse",
+        )
+        m4.metric("Breakdowns Detected", result["num_breakdowns"])
+
+        ec = result.get("equity_curve", {})
+        if ec:
+            ec_df = pd.DataFrame(ec).T.reset_index()
+            ec_df.columns = ["date", "hedged", "unhedged"]
+            ec_df["date"] = pd.to_datetime(ec_df["date"])
+            ec_df = ec_df.sort_values("date")
+
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(
+                x=ec_df["date"], y=ec_df["hedged"],
+                name="Hedged", line=dict(color="#2196F3", width=2),
+            ))
+            fig_eq.add_trace(go.Scatter(
+                x=ec_df["date"], y=ec_df["unhedged"],
+                name=f"Unhedged ({result['benchmark']})",
+                line=dict(color="#FF9800", width=2, dash="dot"),
+            ))
+            fig_eq.update_layout(
+                title="Equity Curve: Hedged vs Unhedged",
+                yaxis_title="Portfolio Value (normalized to 1.0)",
+                xaxis_title="Date",
+                height=460,
+                paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                font=dict(color="#fafafa"),
+                legend=dict(orientation="h", y=1.02),
+            )
+            st.plotly_chart(fig_eq, width="stretch")
+
+        with st.expander("Backtest Parameters"):
+            st.json({
+                "benchmark":       result["benchmark"],
+                "short_window":    short_window,
+                "baseline_window": long_window,
+                "z_threshold":     bt_z,
+                "hedge_hold_days": 10,
+                "rebalance_days":  5,
+            })
