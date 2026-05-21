@@ -182,7 +182,7 @@ with st.sidebar:
     )
     st.divider()
     st.caption(f"Data cached for 5 min · Last load: {datetime.now().strftime('%H:%M:%S')}")
-    if st.button("🔄 Force Refresh", use_container_width=True):
+    if st.button("🔄 Force Refresh", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -242,7 +242,7 @@ with tab1:
             paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
             font=dict(color="#fafafa", size=10),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_stats:
         upper_vals = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool)).stack().values
@@ -260,7 +260,7 @@ with tab1:
         ep = upper_copy.stack().reset_index()
         ep.columns = ["Asset 1", "Asset 2", "Corr"]
         ep = ep.reindex(ep["Corr"].abs().sort_values(ascending=False).index).head(6)
-        st.dataframe(ep.style.format({"Corr": "{:.3f}"}), hide_index=True, use_container_width=True)
+        st.dataframe(ep.style.format({"Corr": "{:.3f}"}), hide_index=True, width="stretch")
 
     # Cross-class heatmap
     st.subheader("Cross-Asset Class Average Correlation")
@@ -282,7 +282,7 @@ with tab1:
     fig2 = px.imshow(class_df, color_continuous_scale=["#d73027", "#ffffbf", "#1a9850"],
                      zmin=-1, zmax=1, text_auto=".2f", height=320)
     fig2.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font=dict(color="#fafafa"))
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
 
 # ══ TAB 2 — BREAKDOWNS ═══════════════════════════════════════════════════════
@@ -307,9 +307,9 @@ with tab2:
             return f"background-color: {SEV_COLOR.get(val, '')}; color: white"
 
         st.dataframe(
-            bd_df.style.applymap(sev_color, subset=["Severity"])
+            bd_df.style.map(sev_color, subset=["Severity"])
                 .format({"Current Corr": "{:.3f}", "Baseline": "{:.3f}", "Z-Score": "{:+.2f}"}),
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
         )
 
         fig_bar = px.bar(
@@ -323,7 +323,7 @@ with tab2:
         fig_bar.add_hline(y=-z_threshold, line_dash="dash", line_color="white")
         fig_bar.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
                               font=dict(color="#fafafa"))
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
 
 
 # ══ TAB 3 — HEDGES ═══════════════════════════════════════════════════════════
@@ -358,7 +358,7 @@ with tab3:
 
         st.dataframe(
             hedge_df[["Instrument", "Direction", "Weight (%)", "Triggered By"]],
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
         )
 
         fig_h = px.bar(
@@ -369,7 +369,7 @@ with tab3:
         )
         fig_h.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
                             font=dict(color="#fafafa"))
-        st.plotly_chart(fig_h, use_container_width=True)
+        st.plotly_chart(fig_h, width="stretch")
 
         with st.expander("Rationale for each hedge"):
             for _, row in hedge_df.iterrows():
