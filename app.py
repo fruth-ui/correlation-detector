@@ -346,10 +346,12 @@ with tab1:
         ep_df.columns = ["Asset 1", "Asset 2", "Correlation"]
         ep_df = ep_df.reindex(ep_df["Correlation"].abs().sort_values(ascending=False).index).head(8)
         st.dataframe(
-            ep_df.style
-                .background_gradient(cmap="RdYlGn", subset=["Correlation"], vmin=-1, vmax=1)
-                .format({"Correlation": "{:.3f}"}),
-            hide_index=True, width="stretch",
+            ep_df,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Correlation": st.column_config.NumberColumn(format="%.3f"),
+            },
         )
 
     # Cross-asset class heatmap
@@ -404,14 +406,16 @@ with tab2:
             "Severity":     b["severity"],
         } for b in breakdowns])
 
-        def sev_color(val):
-            return f"background-color: {SEV_COLOR.get(val, '')}; color: white"
-
         st.dataframe(
-            bd_df.style
-                .map(sev_color, subset=["Severity"])
-                .format({"Current Corr": "{:.3f}", "Baseline": "{:.3f}", "Z-Score": "{:+.2f}"}),
-            hide_index=True, width="stretch",
+            bd_df,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Current Corr": st.column_config.NumberColumn(format="%.3f"),
+                "Baseline":     st.column_config.NumberColumn(format="%.3f"),
+                "Z-Score":      st.column_config.NumberColumn(format="%+.2f"),
+                "Severity":     st.column_config.TextColumn(),
+            },
         )
 
         fig_bar = px.bar(
