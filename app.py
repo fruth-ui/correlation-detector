@@ -37,6 +37,9 @@ ASSETS: Dict[str, List[str]] = {
     "crypto":      ["BTC-USD", "ETH-USD", "SOL-USD"],
 }
 
+# Hedge instruments fetched alongside main universe for backtesting
+HEDGE_SYMBOLS = ["VIXY", "SH", "BITI", "PDBC", "UUP", "TIP", "SHY", "TLT", "GLD"]
+
 CLASS_MAP: Dict[str, str] = {s: c for c, syms in ASSETS.items() for s in syms}
 ALL_SYMBOLS = [s for syms in ASSETS.values() for s in syms]
 
@@ -170,23 +173,41 @@ def get_hedges(bd: Dict) -> List[Dict]:
     return [{**r, "weight": round(min(r["weight"] * scale, 0.25), 3)} for r in rules]
 
 
+def safe_ret(series: pd.Series, key: str) -> float:
+    """Get a return value, returning 0.0 for missing or NaN."""
+    val = series.get(key, 0.0)
+    return 0.0 if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val)
+
+
 def run_backtest(
-    prices: pd.DataFrame, benchmark: str, short_w: int, long_w: int,
-    z_thresh: float, hold_days: int = 10, rebal_days: int = 5,
+    prices: pd.DataFrame, hedge_prices: pd.DataFrame, benchmark: str,
+    short_w: int, long_w: int, z_thresh: float,
+    hold_days: int = 10, rebal_days: int = 5,
 ) -> Dict:
-    rets = prices.pct_change().dropna(how="all")
+    # Merge main prices with hedge instrument prices for return lookup
+    all_prices = pd.concat([prices, hedge_prices], axis=1)
+    all_prices = all_prices.loc[:, ~all_prices.columns.duplicated()]
+
+    rets = all_prices.pct_change()
+    # Only use rows where benchmark has data
     if benchmark not in rets.columns:
-        benchmark = rets.columns[0]
+        benchmark = prices.columns[0]
+    rets = rets[rets[benchmark].notna()]
+
     dates = rets.index.tolist()
+    if len(dates) < long_w + short_w + 5:
+        raise ValueError(f"Not enough data rows ({len(dates)}) for long_w={long_w}.")
+
     hedged, unhedged = [1.0], [1.0]
     breakdown_log, active_hedge, expire_i = [], None, 0
 
     for i in range(long_w, len(dates)):
-        bm_ret = float(rets.iloc[i].get(benchmark, 0) or 0)
+        bm_ret = safe_ret(rets.iloc[i], benchmark)
+
         if (i - long_w) % rebal_days == 0:
-            hist = rets.iloc[:i]
-            stats = compute_baseline(prices.iloc[:i], short_w, long_w)
-            corr = rolling_corr_matrix(prices.iloc[:i], short_w)
+            price_hist = all_prices.iloc[:i]
+            stats = compute_baseline(price_hist[prices.columns], short_w, long_w)
+            corr = rolling_corr_matrix(price_hist[prices.columns], short_w)
             pairs = get_pair_map(corr)
             bds = detect_breakdowns(pairs, stats, z_thresh)
             if bds:
@@ -199,6 +220,8 @@ def run_backtest(
                         if inst in rets.columns and not inst.endswith("_PUT"):
                             sign = 1.0 if h["direction"] == "long" else -1.0
                             active_hedge[inst] = active_hedge.get(inst, 0.0) + sign * h["weight"]
+                if not active_hedge:
+                    active_hedge = None
             else:
                 if i > expire_i:
                     active_hedge = None
@@ -206,29 +229,36 @@ def run_backtest(
         hedge_ret = 0.0
         if active_hedge:
             for inst, w in active_hedge.items():
-                r = rets.iloc[i].get(inst, 0)
-                hedge_ret += w * float(r or 0)
+                hedge_ret += w * safe_ret(rets.iloc[i], inst)
 
         unhedged.append(unhedged[-1] * (1 + bm_ret))
         hedged.append(hedged[-1] * (1 + bm_ret + hedge_ret))
 
     dates_out = [str(d.date()) for d in dates[long_w:]]
-    h_arr, u_arr = np.array(hedged[1:]), np.array(unhedged[1:])
+    h_arr = np.nan_to_num(np.array(hedged[1:]), nan=1.0)
+    u_arr = np.nan_to_num(np.array(unhedged[1:]), nan=1.0)
 
     def sharpe(arr):
-        r = np.diff(arr) / arr[:-1]
-        return float(np.mean(r) / np.std(r) * np.sqrt(252)) if np.std(r) > 0 else 0.0
+        r = np.diff(arr) / np.where(arr[:-1] == 0, 1, arr[:-1])
+        r = r[np.isfinite(r)]
+        return float(np.mean(r) / np.std(r) * np.sqrt(252)) if len(r) > 1 and np.std(r) > 0 else 0.0
 
     def mdd(arr):
+        arr = arr[np.isfinite(arr)]
+        if len(arr) == 0:
+            return 0.0
         peak = np.maximum.accumulate(arr)
-        return float(((arr - peak) / peak).min())
+        return float(((arr - peak) / np.where(peak == 0, 1, peak)).min())
 
     eq = {d: {"hedged": round(float(h), 6), "unhedged": round(float(u), 6)}
           for d, h, u in zip(dates_out, h_arr, u_arr)}
 
+    final_h = float(h_arr[-1]) if len(h_arr) > 0 and np.isfinite(h_arr[-1]) else 1.0
+    final_u = float(u_arr[-1]) if len(u_arr) > 0 and np.isfinite(u_arr[-1]) else 1.0
+
     return {
-        "total_return_hedged":   round(float(h_arr[-1] - 1), 4),
-        "total_return_unhedged": round(float(u_arr[-1] - 1), 4),
+        "total_return_hedged":   round(final_h - 1, 4),
+        "total_return_unhedged": round(final_u - 1, 4),
         "sharpe_hedged":         round(sharpe(h_arr), 3),
         "sharpe_unhedged":       round(sharpe(u_arr), 3),
         "max_drawdown_hedged":   round(mdd(h_arr), 4),
@@ -270,7 +300,8 @@ with st.sidebar:
 # ── Load data ──────────────────────────────────────────────────────────────────
 
 with st.spinner("Fetching live prices from Yahoo Finance…"):
-    prices_raw = fetch_prices(tuple(ALL_SYMBOLS), history_days + long_window + 30)
+    prices_raw  = fetch_prices(tuple(ALL_SYMBOLS), history_days + long_window + 30)
+    hedge_prices = fetch_prices(tuple(HEDGE_SYMBOLS), history_days + long_window + 30)
 
 if prices_raw.empty:
     st.error("Could not fetch price data. Check your internet connection and try refreshing.")
@@ -507,8 +538,8 @@ with tab4:
             with st.spinner("Running walk-forward backtest… (30–60 seconds)"):
                 try:
                     result = run_backtest(
-                        prices_raw, bt_benchmark, short_window,
-                        bt_long_w, bt_z,
+                        prices_raw, hedge_prices, bt_benchmark,
+                        short_window, bt_long_w, bt_z,
                     )
                     st.session_state["bt_result"] = result
                     st.success("Backtest complete!")
