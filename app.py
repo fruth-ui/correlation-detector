@@ -328,7 +328,7 @@ with tab1:
 
     with col_stats:
         upper_mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-        upper_vals = corr_matrix.where(upper_mask).stack().values
+        upper_vals = corr_matrix.values[upper_mask]  # numpy direct — no stack() NaN issues
 
         st.subheader("Summary Stats")
         st.metric("Avg Correlation", f"{upper_vals.mean():.3f}")
@@ -339,12 +339,13 @@ with tab1:
 
         st.divider()
         st.subheader("Most Extreme Pairs")
-        ep = corr_matrix.where(upper_mask).copy()
-        ep.index.name   = "Asset 1"
-        ep.columns.name = "Asset 2"
-        ep_df = ep.stack().reset_index()
-        ep_df.columns = ["Asset 1", "Asset 2", "Correlation"]
-        ep_df = ep_df.reindex(ep_df["Correlation"].abs().sort_values(ascending=False).index).head(8)
+        cols = corr_matrix.columns.tolist()
+        ep_rows = [
+            {"Asset 1": cols[i], "Asset 2": cols[j], "Correlation": float(corr_matrix.values[i, j])}
+            for i in range(len(cols)) for j in range(i + 1, len(cols))
+            if not np.isnan(corr_matrix.values[i, j])
+        ]
+        ep_df = pd.DataFrame(ep_rows).sort_values("Correlation", key=abs, ascending=False).head(8)
         st.dataframe(
             ep_df,
             hide_index=True,
